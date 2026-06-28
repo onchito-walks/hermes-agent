@@ -3793,6 +3793,10 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
                     else:
                         repaired.pop("required", None)
 
+        # Ensure arrays have items (OpenAI rejects arrays without items).
+        if repaired.get("type") == "array" and "items" not in repaired:
+            repaired["items"] = {}
+
         return repaired
 
     normalized = _rewrite_local_refs(schema)

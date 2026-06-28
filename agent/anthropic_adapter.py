@@ -1849,6 +1849,10 @@ def build_anthropic_kwargs(
     # MiniMax Anthropic-compat endpoints support thinking (manual mode only,
     # not adaptive).  Haiku does NOT support extended thinking — skip entirely.
     #
+    # NVIDIA-hosted MiniMax is the exception: NVIDIA rejects the nonstandard
+    # `think` parameter on this route, so we must not emit thinking kwargs when
+    # the model is MiniMax served via the NVIDIA inference provider.
+    #
     # Kimi's /coding endpoint speaks the Anthropic Messages protocol but has
     # its own thinking semantics: when ``thinking.enabled`` is sent, Kimi
     # validates the message history and requires every prior assistant
@@ -1867,7 +1871,14 @@ def build_anthropic_kwargs(
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
     _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
-    if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
+    _is_nvidia_minimax = (
+        (provider or "").strip().lower() in {"nvidia", "nvidia-inference"}
+        and "minimax" in (model or "").strip().lower()
+    ) or (
+        (base_url or "").strip().lower().startswith("https://integrate.api.nvidia.com")
+        and "minimax" in (model or "").strip().lower()
+    )
+    if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding and not _is_nvidia_minimax:
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)

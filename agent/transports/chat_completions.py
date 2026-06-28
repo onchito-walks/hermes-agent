@@ -381,7 +381,12 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body["options"] = options
 
         # Ollama/custom think=false
-        if params.get("is_custom_provider", False):
+        # NVIDIA-hosted MiniMax rejects the `think` parameter, so we must not emit it.
+        _is_nvidia_minimax = (
+            (base_url or "").strip().lower().startswith("https://integrate.api.nvidia.com")
+            and "minimax" in (model or "").strip().lower()
+        )
+        if params.get("is_custom_provider", False) and not _is_nvidia_minimax:
             if reasoning_config and isinstance(reasoning_config, dict):
                 _effort = (reasoning_config.get("effort") or "").strip().lower()
                 _enabled = reasoning_config.get("enabled", True)
@@ -408,10 +413,39 @@ class ChatCompletionsTransport(ProviderTransport):
             if thinking_config:
                 extra_body["thinking_config"] = thinking_config
 
+        # NVIDIA NIM thinking_config
+        # Translate Hermes/OpenRouter-style reasoning config to NVIDIA NIM format.
+        # NVIDIA NIM uses extra_body.thinking_config with includeThoughts and
+        # thinkingLevel (low/medium/high) for thinking/reasoning models.
+        if is_nvidia_nim and reasoning_config and isinstance(reasoning_config, dict):
+            nvidia_thinking_config = {}
+            if reasoning_config.get("enabled") is False or reasoning_config.get("effort") == "none":
+                # Disable thinking - omit the field entirely (NVIDIA default)
+                pass
+            else:
+                nvidia_thinking_config["includeThoughts"] = True
+                effort = str(reasoning_config.get("effort", "medium") or "medium").strip().lower()
+                if effort in {"low", "medium", "high"}:
+                    nvidia_thinking_config["thinkingLevel"] = effort
+                else:
+                    nvidia_thinking_config["thinkingLevel"] = "medium"
+            if nvidia_thinking_config:
+                extra_body["thinking_config"] = nvidia_thinking_config
+
         # Merge any pre-built extra_body additions
         additions = params.get("extra_body_additions")
         if additions:
             extra_body.update(additions)
+
+        # NVIDIA NIM endpoints reject the nonstandard `think` parameter.
+        # Strip it regardless of how it was injected (Ollama path, custom
+        # provider path, or extra_body_additions).  Only `thinking_config`
+        # and `reasoning` (OpenRouter) are safe on NVIDIA.
+        _is_nvidia_endpoint = (
+            (base_url or "").strip().lower().startswith("https://integrate.api.nvidia.com")
+        )
+        if _is_nvidia_endpoint and "think" in extra_body:
+            del extra_body["think"]
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body

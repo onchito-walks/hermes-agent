@@ -31,32 +31,30 @@ class TestMinimaxThinkingSupport:
     thinking (which is Claude 4.6-only).
     """
 
-    def test_minimax_m27_gets_manual_thinking(self):
+    def test_minimax_m27_omits_thinking_on_native_provider(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
             model="MiniMax-M2.7",
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": False, "effort": "none"},
+            base_url="https://api.minimax.io/anthropic",
         )
-        assert "thinking" in kwargs
-        assert kwargs["thinking"]["type"] == "enabled"
-        assert "budget_tokens" in kwargs["thinking"]
-        # MiniMax should NOT get adaptive thinking or output_config
+        assert "thinking" not in kwargs
         assert "output_config" not in kwargs
 
-    def test_minimax_m25_gets_manual_thinking(self):
+    def test_minimax_m25_omits_thinking_on_native_provider(self):
         from agent.anthropic_adapter import build_anthropic_kwargs
         kwargs = build_anthropic_kwargs(
             model="MiniMax-M2.5",
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "high"},
+            reasoning_config={"enabled": False, "effort": "none"},
+            base_url="https://api.minimax.io/anthropic",
         )
-        assert "thinking" in kwargs
-        assert kwargs["thinking"]["type"] == "enabled"
+        assert "thinking" not in kwargs
 
     def test_thinking_still_works_for_claude(self):
         from agent.anthropic_adapter import build_anthropic_kwargs

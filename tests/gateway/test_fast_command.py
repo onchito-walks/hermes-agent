@@ -121,6 +121,49 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_gateway_turn_route_applies_lane_reasoning_and_toolsets(monkeypatch):
+    runner = _make_runner()
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://openrouter.ai/api/v1",
+        "provider": "openrouter",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+    cfg = {
+        "model_lane_router": {
+            "enabled": True,
+            "default_lane": "executor-fast",
+            "models": {
+                "fast_worker": {"provider": "openrouter", "model": "z-ai/glm4.7"},
+            },
+            "lanes": {
+                "executor-fast": {
+                    "models": ["fast_worker"],
+                    "reasoning_effort": "low",
+                    "toolsets": ["terminal", "file"],
+                },
+                "instant-code-executor": {
+                    "models": ["fast_worker"],
+                    "reasoning_effort": "none",
+                    "toolsets": ["terminal"],
+                },
+            },
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "run pytest", "gpt-5", runtime_kwargs)
+
+    assert route["model"] == "z-ai/glm4.7"
+    assert route["runtime"]["provider"] == "openrouter"
+    assert route["reasoning_config"] == {"enabled": False}
+    assert route["enabled_toolsets"] == ["terminal"]
+    assert route["lane_route"].lane == "instant-code-executor"
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()

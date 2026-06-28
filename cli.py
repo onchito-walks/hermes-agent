@@ -3444,10 +3444,10 @@ class HermesCLI:
     def _resolve_turn_agent_config(self, user_message: str) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
-        Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        Uses the session's primary model/provider unless ``model_lane_router``
+        is enabled.  Lane routing is deliberately per-turn and non-mutating:
+        it may return route-scoped model, reasoning, and toolset overrides, but
+        it does not rewrite ``config.yaml`` or global CLI state.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -3460,16 +3460,61 @@ class HermesCLI:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        effective_model = self.model
+        effective_runtime = dict(runtime)
+        route_reasoning_config = getattr(self, "reasoning_config", None)
+        route_enabled_toolsets = getattr(self, "enabled_toolsets", None)
+        route_disabled_toolsets = getattr(self, "disabled_toolsets", None)
+        lane_route = None
+
+        try:
+            from agent.lane_router import load_health_state, resolve_lane_route
+            lane_route = resolve_lane_route(user_message, CLI_CONFIG, health_state=load_health_state(CLI_CONFIG))
+            if lane_route.enabled and not lane_route.approval_required:
+                if lane_route.model:
+                    effective_model = lane_route.model
+                if lane_route.provider and lane_route.provider != effective_runtime.get("provider"):
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        resolved = resolve_runtime_provider(requested=lane_route.provider)
+                        effective_runtime.update({
+                            "api_key": resolved.get("api_key", effective_runtime.get("api_key")),
+                            "base_url": resolved.get("base_url", effective_runtime.get("base_url")),
+                            "provider": resolved.get("provider", lane_route.provider),
+                            "api_mode": resolved.get("api_mode", effective_runtime.get("api_mode")),
+                            "command": resolved.get("command"),
+                            "args": list(resolved.get("args") or []),
+                            "credential_pool": resolved.get("credential_pool"),
+                        })
+                    except Exception as exc:
+                        logger.debug("lane router provider resolution failed: %s", exc)
+                if lane_route.reasoning_config is not None:
+                    route_reasoning_config = lane_route.reasoning_config
+                if lane_route.enabled_toolsets:
+                    route_enabled_toolsets = list(lane_route.enabled_toolsets)
+                if lane_route.disabled_toolsets:
+                    route_disabled_toolsets = list(lane_route.disabled_toolsets)
+        except Exception as exc:
+            logger.debug("lane router disabled for this turn after error: %s", exc)
+            lane_route = None
+
         route = {
-            "model": self.model,
-            "runtime": runtime,
+            "model": effective_model,
+            "runtime": effective_runtime,
+            "reasoning_config": route_reasoning_config,
+            "enabled_toolsets": route_enabled_toolsets,
+            "disabled_toolsets": route_disabled_toolsets,
+            "lane_route": lane_route,
             "signature": (
-                self.model,
-                runtime["provider"],
-                runtime["base_url"],
-                runtime["api_mode"],
-                runtime["command"],
-                tuple(runtime["args"]),
+                effective_model,
+                effective_runtime["provider"],
+                effective_runtime["base_url"],
+                effective_runtime["api_mode"],
+                effective_runtime["command"],
+                tuple(effective_runtime["args"]),
+                tuple(route_enabled_toolsets or ()),
+                tuple(route_disabled_toolsets or ()),
+                getattr(lane_route, "signature_fragment", None),
             ),
         }
 
@@ -3485,7 +3530,7 @@ class HermesCLI:
         route["request_overrides"] = overrides
         return route
 
-    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
+    def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None, reasoning_config_override: dict | None = None, enabled_toolsets_override: list | None = None, disabled_toolsets_override: list | None = None) -> bool:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
@@ -3583,13 +3628,13 @@ class HermesCLI:
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
                 max_iterations=self.max_turns,
-                enabled_toolsets=self.enabled_toolsets,
-                disabled_toolsets=self.disabled_toolsets,
+                enabled_toolsets=enabled_toolsets_override if enabled_toolsets_override is not None else self.enabled_toolsets,
+                disabled_toolsets=disabled_toolsets_override if disabled_toolsets_override is not None else self.disabled_toolsets,
                 verbose_logging=self.verbose,
                 quiet_mode=not self.verbose,
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
+                reasoning_config=reasoning_config_override if reasoning_config_override is not None else self.reasoning_config,
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,
@@ -6725,13 +6770,14 @@ class HermesCLI:
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
-                    enabled_toolsets=self.enabled_toolsets,
+                    enabled_toolsets=turn_route.get("enabled_toolsets") if turn_route.get("enabled_toolsets") is not None else self.enabled_toolsets,
+                    disabled_toolsets=turn_route.get("disabled_toolsets") if turn_route.get("disabled_toolsets") is not None else self.disabled_toolsets,
                     quiet_mode=True,
                     verbose_logging=False,
                     session_id=task_id,
                     platform="cli",
                     session_db=self._session_db,
-                    reasoning_config=self.reasoning_config,
+                    reasoning_config=turn_route.get("reasoning_config") if turn_route.get("reasoning_config") is not None else self.reasoning_config,
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
@@ -9040,6 +9086,9 @@ class HermesCLI:
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
+            reasoning_config_override=turn_route.get("reasoning_config"),
+            enabled_toolsets_override=turn_route.get("enabled_toolsets"),
+            disabled_toolsets_override=turn_route.get("disabled_toolsets"),
         ):
             return None
         
@@ -9404,6 +9453,13 @@ class HermesCLI:
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+
+            if result and result.get("error"):
+                try:
+                    from agent.lane_router import note_route_error
+                    note_route_error(CLI_CONFIG, turn_route.get("lane_route"), result.get("error"))
+                except Exception:
+                    logger.debug("lane-router health update failed", exc_info=True)
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -11987,6 +12043,9 @@ def main(
                     model_override=turn_route["model"],
                     runtime_override=turn_route["runtime"],
                     request_overrides=turn_route.get("request_overrides"),
+                    reasoning_config_override=turn_route.get("reasoning_config"),
+                    enabled_toolsets_override=turn_route.get("enabled_toolsets"),
+                    disabled_toolsets_override=turn_route.get("disabled_toolsets"),
                 ):
                     cli.agent.quiet_mode = True
                     cli.agent.suppress_status_output = True

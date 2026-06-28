@@ -88,15 +88,33 @@ class TestAgentConfigSignature:
         assert sig1 != sig2
 
     def test_reasoning_not_in_signature(self):
-        """Reasoning config is set per-message, not part of the signature."""
+        """Legacy callers that omit route_signature still get stable signatures."""
         from gateway.run import GatewayRunner
 
-        runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
-        # Same config — signature should be identical regardless of what
-        # reasoning_config the caller might have (it's not passed in)
+        runtime = {"api_key": "***", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
         sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         assert sig1 == sig2
+
+    def test_lane_route_signature_busts_cache(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "***", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        sig_executor = GatewayRunner._agent_config_signature(
+            "z-ai/glm4.7",
+            runtime,
+            ["terminal"],
+            "",
+            route_signature=("instant-code-executor", "glm4_7", "none"),
+        )
+        sig_researcher = GatewayRunner._agent_config_signature(
+            "z-ai/glm4.7",
+            runtime,
+            ["terminal"],
+            "",
+            route_signature=("researcher", "glm4_7", "medium"),
+        )
+        assert sig_executor != sig_researcher
 
     # ---------------------------------------------------------------
     # cache_keys (compression/context config cache-busting)

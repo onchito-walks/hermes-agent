@@ -1407,10 +1407,10 @@ class GatewayRunner:
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Uses the session's primary model/provider unless ``model_lane_router``
+        is enabled. Lane routing is per-turn and non-mutating: it can override
+        model/runtime/reasoning/toolsets for this agent instance without writing
+        config.yaml or global gateway state.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -1423,16 +1423,67 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+        effective_model = model
+        effective_runtime = dict(runtime)
+        lane_route = None
+        route_reasoning_config = getattr(self, "_reasoning_config", None)
+        route_enabled_toolsets = None
+        route_disabled_toolsets = None
+
+        try:
+            from hermes_cli.config import load_config
+            from agent.lane_router import load_health_state, resolve_lane_route
+            cfg = load_config()
+            lane_route = resolve_lane_route(
+                user_message,
+                cfg,
+                health_state=load_health_state(cfg),
+            )
+            if lane_route.enabled and not lane_route.approval_required:
+                if lane_route.model:
+                    effective_model = lane_route.model
+                if lane_route.provider and lane_route.provider != effective_runtime.get("provider"):
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        resolved = resolve_runtime_provider(requested=lane_route.provider)
+                        effective_runtime.update({
+                            "api_key": resolved.get("api_key", effective_runtime.get("api_key")),
+                            "base_url": resolved.get("base_url", effective_runtime.get("base_url")),
+                            "provider": resolved.get("provider", lane_route.provider),
+                            "api_mode": resolved.get("api_mode", effective_runtime.get("api_mode")),
+                            "command": resolved.get("command"),
+                            "args": list(resolved.get("args") or []),
+                            "credential_pool": resolved.get("credential_pool"),
+                        })
+                    except Exception:
+                        logger.debug("gateway lane-router provider resolution failed", exc_info=True)
+                if lane_route.reasoning_config is not None:
+                    route_reasoning_config = lane_route.reasoning_config
+                if lane_route.enabled_toolsets:
+                    route_enabled_toolsets = list(lane_route.enabled_toolsets)
+                if lane_route.disabled_toolsets:
+                    route_disabled_toolsets = list(lane_route.disabled_toolsets)
+        except Exception:
+            logger.debug("gateway lane router disabled for this turn", exc_info=True)
+            lane_route = None
+
         route = {
-            "model": model,
-            "runtime": runtime,
+            "model": effective_model,
+            "runtime": effective_runtime,
+            "reasoning_config": route_reasoning_config,
+            "enabled_toolsets": route_enabled_toolsets,
+            "disabled_toolsets": route_disabled_toolsets,
+            "lane_route": lane_route,
             "signature": (
-                model,
-                runtime["provider"],
-                runtime["base_url"],
-                runtime["api_mode"],
-                runtime["command"],
-                tuple(runtime["args"]),
+                effective_model,
+                effective_runtime["provider"],
+                effective_runtime["base_url"],
+                effective_runtime["api_mode"],
+                effective_runtime["command"],
+                tuple(effective_runtime["args"]),
+                tuple(route_enabled_toolsets or ()),
+                tuple(route_disabled_toolsets or ()),
+                getattr(lane_route, "signature_fragment", None),
             ),
         }
 
@@ -8439,9 +8490,9 @@ class GatewayRunner:
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
-                    reasoning_config=reasoning_config,
+                    enabled_toolsets=turn_route.get("enabled_toolsets") or enabled_toolsets,
+                    disabled_toolsets=turn_route.get("disabled_toolsets") or disabled_toolsets,
+                    reasoning_config=turn_route.get("reasoning_config") if turn_route.get("reasoning_config") is not None else reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -8470,6 +8521,14 @@ class GatewayRunner:
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
+
+            if result and result.get("error"):
+                try:
+                    from hermes_cli.config import load_config
+                    from agent.lane_router import note_route_error
+                    note_route_error(load_config(), turn_route.get("lane_route"), result.get("error"))
+                except Exception:
+                    logger.debug("gateway lane-router background health update failed", exc_info=True)
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -10874,6 +10933,7 @@ class GatewayRunner:
         enabled_toolsets: list,
         ephemeral_prompt: str,
         cache_keys: dict | None = None,
+        route_signature: tuple | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -10911,6 +10971,7 @@ class GatewayRunner:
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
+                route_signature,
             ],
             sort_keys=True,
             default=str,
@@ -12213,6 +12274,9 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            route_enabled_toolsets = turn_route.get("enabled_toolsets") or enabled_toolsets
+            route_disabled_toolsets = turn_route.get("disabled_toolsets") or disabled_toolsets
+            route_reasoning_config = turn_route.get("reasoning_config") if turn_route.get("reasoning_config") is not None else reasoning_config
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -12220,9 +12284,10 @@ class GatewayRunner:
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
-                enabled_toolsets,
+                route_enabled_toolsets,
                 combined_ephemeral,
                 cache_keys=self._extract_cache_busting_config(user_config),
+                route_signature=turn_route.get("signature"),
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -12250,11 +12315,11 @@ class GatewayRunner:
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
+                    enabled_toolsets=route_enabled_toolsets,
+                    disabled_toolsets=route_disabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
-                    reasoning_config=reasoning_config,
+                    reasoning_config=route_reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -12288,7 +12353,7 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
-            agent.reasoning_config = reasoning_config
+            agent.reasoning_config = route_reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
@@ -12630,6 +12695,14 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+
+            if result and result.get("error"):
+                try:
+                    from hermes_cli.config import load_config
+                    from agent.lane_router import note_route_error
+                    note_route_error(load_config(), turn_route.get("lane_route"), result.get("error"))
+                except Exception:
+                    logger.debug("gateway lane-router health update failed", exc_info=True)
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0

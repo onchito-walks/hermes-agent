@@ -212,6 +212,50 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
 
     assert result["model"] == "gpt-5"
     assert result["runtime"]["provider"] == "openrouter"
+    assert result["lane_route"] is None or result["lane_route"].enabled is False
+
+
+def test_cli_turn_routing_applies_lane_reasoning_and_toolsets(monkeypatch):
+    cli = _import_cli()
+    config_copy = dict(cli.CLI_CONFIG)
+    config_copy["model_lane_router"] = {
+        "enabled": True,
+        "default_lane": "executor-fast",
+        "models": {
+            "fast_worker": {
+                "provider": "openrouter",
+                "model": "z-ai/glm4.7",
+            }
+        },
+        "lanes": {
+            "executor-fast": {
+                "models": ["fast_worker"],
+                "reasoning_effort": "low",
+                "toolsets": ["terminal", "file"],
+            },
+            "instant-code-executor": {
+                "models": ["fast_worker"],
+                "reasoning_effort": "none",
+                "toolsets": ["terminal"],
+            },
+        },
+    }
+    monkeypatch.setattr(cli, "CLI_CONFIG", config_copy)
+
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.provider = "openrouter"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "https://openrouter.ai/api/v1"
+    shell.api_key = "sk-primary"
+
+    result = shell._resolve_turn_agent_config("run pytest")
+
+    assert result["model"] == "z-ai/glm4.7"
+    assert result["runtime"]["provider"] == "openrouter"
+    assert result["reasoning_config"] == {"enabled": False}
+    assert result["enabled_toolsets"] == ["terminal"]
+    assert result["lane_route"].lane == "instant-code-executor"
+    assert result["signature"] != ("gpt-5", "openrouter", "https://openrouter.ai/api/v1", "chat_completions", None, ())
 
 
 def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):

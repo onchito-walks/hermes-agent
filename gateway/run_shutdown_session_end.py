@@ -33,7 +33,8 @@ class GatewaySessionEndMixin:
         for message in messages:
             await self._send_notice_logged(
                 adapter, str(source.chat_id), message, source.platform.value if source.platform else "",
-                "Failed to send session-end plugin message to %s:%s: %s", metadata=metadata)
+                f"Failed to send session-end plugin message (session {str(session_key).replace('%', '%%')}) to %s:%s: %s",
+                metadata=metadata)
 
     async def _reset_session_off_loop(self, *, session_key: Optional[str] = None, **kwargs: Any) -> None:
         """Plugin ``on_session_reset`` off-loop under the profile owning ``session_key``, bounded like
